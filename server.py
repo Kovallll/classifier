@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 DB_URL = os.getenv('DATABASE_URL', 'postgres://user:pass@db:5432/mydb')
-MODEL_DIR = '/app/models'
+MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
 MODEL_PATH = os.path.join(MODEL_DIR, 'model.bin')
 DATA_PATH = os.path.join(MODEL_DIR, 'train.txt')
 META_PATH = os.path.join(MODEL_DIR, 'metadata.json')
