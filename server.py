@@ -117,7 +117,7 @@ class FastTextCategorizerServicer:
         # Параметры
         self.lr = 0.5  # ← ДОБАВИТЬ: learning rate (используется в обучении)
         self.word_ngrams = 2
-        self.dim = 50
+        self.dim = 25
         self.epoch = 25
         self.bucket = 100000
         self.incremental_epoch = 5
