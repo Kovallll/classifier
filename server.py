@@ -117,9 +117,11 @@ class FastTextCategorizerServicer:
         # Параметры
         self.lr = 0.5  # ← ДОБАВИТЬ: learning rate (используется в обучении)
         self.word_ngrams = 2
-        self.dim = 100
-        self.epoch = 100
+        self.dim = 50
+        self.epoch = 25
+        self.bucket = 100000
         self.incremental_epoch = 5
+        self.thread = 1
         
         self._init_model()
         self._start_watcher()
@@ -185,6 +187,8 @@ class FastTextCategorizerServicer:
                     lr=self.lr,
                     epoch=self.epoch,
                     wordNgrams=self.word_ngrams,
+                    bucket=self.bucket,
+                    thread=self.thread,
                     dim=self.dim,
                     loss='softmax'
                 )
