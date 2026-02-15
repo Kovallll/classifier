@@ -4,7 +4,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Установка системных зависимостей
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
     build-essential \
     g++ \
     libpq-dev \

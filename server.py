@@ -392,15 +392,17 @@ class FastTextCategorizerServicer:
 
 def serve():
     """Запуск gRPC сервера"""
+    port = os.getenv('PORT', '50051')
+    
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     
     servicer = FastTextCategorizerServicer()
     categorizer_pb2_grpc.add_ExpenseCategorizerServicer_to_server(servicer, server)
     
-    server.add_insecure_port('[::]:50051')
+    server.add_insecure_port(f'0.0.0.0:{port}')
     server.start()
     
-    logger.info("🚀 gRPC сервер запущен на порту 50051")
+    logger.info(f"🚀 gRPC сервер запущен на порту {port}")
     logger.info(f"📊 PostgreSQL: {DB_URL.replace('pass', '***')}")
     
     server.wait_for_termination()
