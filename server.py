@@ -1,4 +1,3 @@
-# ml-service/server.py
 import grpc
 from concurrent import futures
 import categorizer_pb2
