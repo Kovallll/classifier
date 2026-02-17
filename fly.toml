@@ -19,6 +19,11 @@ primary_region = 'arn'
   [[services.ports]]
     port = 50051
 
+  [[services.tcp_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "60s"  
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
