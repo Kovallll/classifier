@@ -11,13 +11,13 @@ RUN apt-get update -qq && \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY classifier/requirements.txt .
+COPY requirements.txt .
 
 # Установка Python пакетов
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-COPY classifier/ .
+COPY . .
 
 # Генерация gRPC кода
 RUN python -m grpc_tools.protoc \
