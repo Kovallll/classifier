@@ -1,7 +1,3 @@
-import grpc
-from concurrent import futures
-import categorizer_pb2
-import categorizer_pb2_grpc
 import fasttext
 import psycopg2
 import psycopg2.extras
@@ -10,23 +6,27 @@ import re
 import logging
 import tempfile
 import hashlib
-import io
 from datetime import datetime
 from threading import Lock
 import time
 import json
 import threading
+from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Конфигурация
 DB_URL = os.getenv('DATABASE_URL', 'postgres://user:pass@db:5432/mydb')
+PORT = int(os.getenv('PORT', '8080'))
+
+app = Flask(__name__)
+
 
 class DatabaseReader:
     def __init__(self, db_url):
         self.db_url = db_url
-        self.last_trained_at = datetime(1970, 1, 1)  # В памяти, не в файле
+        self.last_trained_at = datetime(1970, 1, 1)
     
     def _get_conn(self):
         return psycopg2.connect(self.db_url)
@@ -67,17 +67,17 @@ class DatabaseReader:
             conn.close()
 
 
-class FastTextCategorizerServicer:
+class CategorizerService:
     def __init__(self):
         self.db = DatabaseReader(DB_URL)
         self.model = None
         self.is_training = False
         self.training_lock = Lock()
         self.categories_cache = []
-        self.training_data = []  # Храним в памяти вместо файла
-        self.last_trained_hash = set()  # Хеши уже обученных примеров
+        self.training_data = []
+        self.last_trained_hash = set()
         
-        # Параметры
+        # Параметры FastText
         self.lr = 0.5
         self.word_ngrams = 2
         self.dim = 25
@@ -110,12 +110,11 @@ class FastTextCategorizerServicer:
         return lines
     
     def _train_model_from_lines(self, lines: list[str], epoch: int = None) -> bool:
-        """Обучение модели из списка строк в памяти (без файлов)"""
+        """Обучение модели из списка строк в памяти"""
         if not lines:
             logger.error("❌ Нет данных для обучения")
             return False
         
-        # Создаём временный файл только для FastText (библиотека требует файл)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
             f.write('\n'.join(lines))
             temp_path = f.name
@@ -133,7 +132,6 @@ class FastTextCategorizerServicer:
             )
             return True
         finally:
-            # Удаляем временный файл
             try:
                 os.unlink(temp_path)
             except:
@@ -154,11 +152,9 @@ class FastTextCategorizerServicer:
                     logger.error("❌ Нет валидных примеров для обучения!")
                     return False
                 
-                # Обновляем хеши обученных примеров
                 self.training_data = lines
                 self.last_trained_hash = {hashlib.md5(line.encode()).hexdigest() for line in lines}
                 
-                # Находим максимальную дату создания примера
                 max_created = datetime(1970, 1, 1)
                 for cat in categories:
                     for created_at in cat.get('created_ats', []):
@@ -193,7 +189,6 @@ class FastTextCategorizerServicer:
                     logger.warning("⚠️ Нет категорий в БД!")
                     return False
                 
-                # Получаем ВСЕ примеры, но фильтруем только новые по хешу
                 all_lines = self._generate_training_lines(categories)
                 new_lines = []
                 max_created = self.db.last_trained_at
@@ -207,17 +202,14 @@ class FastTextCategorizerServicer:
                             if line_hash not in self.last_trained_hash:
                                 new_lines.append(line)
                                 self.last_trained_hash.add(line_hash)
-                                # Отслеживаем максимальную дату
                                 if created_at and created_at > max_created:
                                     max_created = created_at
                 
                 if not new_lines:
                     logger.info("✅ Нет новых данных для обучения")
-                    # Обновляем время, чтобы не проверять снова
                     self.db.last_trained_at = datetime.now()
                     return False
                 
-                # Объединяем старые и новые данные
                 combined_lines = self.training_data + new_lines
                 self.training_data = combined_lines
                 
@@ -241,12 +233,10 @@ class FastTextCategorizerServicer:
     
     def _init_model(self):
         """Инициализация модели"""
-        # Всегда делаем полное обучение при старте (нет сохраненной модели)
         logger.info("🆕 Инициализация: полное обучение...")
         success = self._full_train()
         if not success:
             logger.error("❌ Не удалось выполнить начальное обучение!")
-            # Создаём пустую модель-заглушку, чтобы сервер не упал
             self._create_dummy_model()
     
     def _create_dummy_model(self):
@@ -261,7 +251,6 @@ class FastTextCategorizerServicer:
     def _start_watcher(self):
         """Проверяет новые данные раз в 30 секунд"""
         def watch():
-            # Ждём первичной инициализации
             time.sleep(5)
             while True:
                 time.sleep(30)
@@ -273,8 +262,6 @@ class FastTextCategorizerServicer:
                     if new_count > 0:
                         logger.info(f"🔄 Watcher: {new_count} новых примеров, запуск обучения...")
                         self._incremental_train()
-                    else:
-                        logger.debug("✅ Нет новых примеров")
                         
                 except Exception as e:
                     logger.error(f"Ошибка watcher: {e}")
@@ -282,25 +269,27 @@ class FastTextCategorizerServicer:
         threading.Thread(target=watch, daemon=True).start()
         logger.info("👁️ Watcher запущен (проверка каждые 30с)")
     
-    # ============ gRPC методы ============
-    
-    def Predict(self, request, context):
+    def predict(self, text: str) -> dict:
         """Предсказание категории"""
         if self.is_training:
-            context.set_code(grpc.StatusCode.UNAVAILABLE)
-            context.set_details("Модель обучается, подождите")
-            return categorizer_pb2.PredictResponse()
+            return {
+                'success': False,
+                'error': 'Модель обучается, подождите',
+                'is_training': True
+            }
         
         if not self.model:
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details("Модель не загружена")
-            return categorizer_pb2.PredictResponse()
+            return {
+                'success': False,
+                'error': 'Модель не загружена'
+            }
         
-        clean = self._clean_text(request.text)
+        clean = self._clean_text(text)
         if not clean:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("Пустой текст")
-            return categorizer_pb2.PredictResponse()
+            return {
+                'success': False,
+                'error': 'Пустой текст'
+            }
         
         try:
             labels, probs = self.model.predict(clean, k=3)
@@ -314,35 +303,34 @@ class FastTextCategorizerServicer:
                     {'name': str(cat_id), 'icon': '❓', 'color': '#CCCCCC'}
                 )
                 
-                alternatives.append(categorizer_pb2.PredictionResult(
-                    category_id=str(cat_id),
-                    category_name=cat_meta['name'],
-                    category_icon=cat_meta['icon'],
-                    category_color=cat_meta['color'],
-                    confidence=float(prob)
-                ))
+                alternatives.append({
+                    'category_id': str(cat_id),
+                    'category_name': cat_meta['name'],
+                    'category_icon': cat_meta['icon'],
+                    'category_color': cat_meta['color'],
+                    'confidence': float(prob)
+                })
             
             primary = alternatives[0] if alternatives else None
             
-            return categorizer_pb2.PredictResponse(
-                primary=primary,
-                alternatives=alternatives[1:],
-                needs_confirmation=(primary.confidence < 0.7) if primary else True,
-                source='fasttext'
-            )
+            return {
+                'success': True,
+                'primary': primary,
+                'alternatives': alternatives[1:],
+                'needs_confirmation': (primary['confidence'] < 0.7) if primary else True,
+                'source': 'fasttext'
+            }
             
         except Exception as e:
             logger.error(f"Ошибка предсказания: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return categorizer_pb2.PredictResponse()
+            return {
+                'success': False,
+                'error': str(e)
+            }
     
-    def ForceRetrain(self, request, context):
+    def force_retrain(self, full: bool = False) -> dict:
         """Принудительное обучение"""
-        force_full = request.full
-        
-        if force_full:
-            # Сбрасываем хеши для полного переобучения
+        if full:
             self.last_trained_hash = set()
             self.training_data = []
             self.db.last_trained_at = datetime(1970, 1, 1)
@@ -352,29 +340,31 @@ class FastTextCategorizerServicer:
             success = self._incremental_train()
             msg = "Инкрементальное обучение выполнено" if success else "Нет новых данных"
         
-        return categorizer_pb2.StatusResponse(
-            success=success,
-            message=msg,
-            categories_count=len(self.categories_cache),
-            is_training=self.is_training
-        )
+        return {
+            'success': success,
+            'message': msg,
+            'categories_count': len(self.categories_cache),
+            'is_training': self.is_training
+        }
     
-    def GetStatus(self, request, context):
+    def get_status(self) -> dict:
         """Статус сервиса"""
-        return categorizer_pb2.StatusResponse(
-            success=True,
-            message="Сервис работает",
-            categories_count=len(self.categories_cache),
-            is_training=self.is_training
-        )
+        return {
+            'success': True,
+            'message': 'Сервис работает',
+            'categories_count': len(self.categories_cache),
+            'is_training': self.is_training
+        }
     
-    def GetModelInfo(self, request, context):
+    def get_model_info(self) -> dict:
         """Информация о модели"""
-        info = {
+        return {
+            'success': True,
             'last_trained_at': self.db.last_trained_at.isoformat(),
             'examples_count': len(self.training_data),
             'categories_count': len(self.categories_cache),
             'unique_hashes': len(self.last_trained_hash),
+            'is_training': self.is_training,
             'params': {
                 'lr': self.lr,
                 'epoch': self.epoch,
@@ -382,33 +372,70 @@ class FastTextCategorizerServicer:
                 'dim': self.dim
             }
         }
-        
-        return categorizer_pb2.ModelInfoResponse(
-            model_path='in-memory',
-            data_hash=str(len(self.last_trained_hash)),
-            categories_count=len(self.categories_cache),
-            is_training=self.is_training,
-            metadata=json.dumps(info)
-        )
 
 
-def serve():
-    """Запуск gRPC сервера"""
-    port = os.getenv('PORT', '50051')
+# Создаём сервис при старте
+service = CategorizerService()
+
+
+# ============ HTTP Endpoints ============
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check для Render/Fly.io"""
+    return jsonify({'status': 'ok', 'is_training': service.is_training})
+
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    """Предсказание категории"""
+    data = request.get_json()
+    if not data or 'text' not in data:
+        return jsonify({'success': False, 'error': 'Поле text обязательно'}), 400
     
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    
-    servicer = FastTextCategorizerServicer()
-    categorizer_pb2_grpc.add_ExpenseCategorizerServicer_to_server(servicer, server)
-    
-    server.add_insecure_port(f'0.0.0.0:{port}')
-    server.start()
-    
-    logger.info(f"🚀 gRPC сервер запущен на порту {port}")
-    logger.info(f"📊 PostgreSQL: {DB_URL.replace('pass', '***') if 'pass' in DB_URL else '***'}")
-    
-    server.wait_for_termination()
+    result = service.predict(data['text'])
+    status_code = 200 if result.get('success') else (503 if result.get('is_training') else 500)
+    return jsonify(result), status_code
+
+
+@app.route('/retrain', methods=['POST'])
+def retrain():
+    """Принудительное обучение"""
+    data = request.get_json() or {}
+    result = service.force_retrain(full=data.get('full', False))
+    return jsonify(result)
+
+
+@app.route('/status', methods=['GET'])
+def status():
+    """Статус сервиса"""
+    return jsonify(service.get_status())
+
+
+@app.route('/model-info', methods=['GET'])
+def model_info():
+    """Информация о модели"""
+    return jsonify(service.get_model_info())
+
+
+@app.route('/categories', methods=['GET'])
+def get_categories():
+    """Получение списка категорий"""
+    return jsonify({
+        'success': True,
+        'categories': [
+            {
+                'id': c['id'],
+                'name': c['name'],
+                'icon': c['icon'],
+                'color': c['color']
+            }
+            for c in service.categories_cache
+        ]
+    })
 
 
 if __name__ == '__main__':
-    serve()
+    logger.info(f"🚀 HTTP сервер запускается на порту {PORT}")
+    # Для production используем threaded=True, для Render/Fly.io это важно
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
