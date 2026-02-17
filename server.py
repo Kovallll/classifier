@@ -199,57 +199,84 @@ class FastTextCategorizerServicer:
                 self.is_training = False
     
     def _incremental_train(self):
-        """Инкрементальное обучение только на новых данных"""
-        with self.training_lock:
-            self.is_training = True
-            try:
-                new_examples = self.db.get_new_examples(self.db.last_trained_at)
-                if not new_examples:
-                    logger.info("✅ Нет новых данных для обучения")
-                    return False
-                
-                lines = []
-                for ex in new_examples:
-                    clean = self._clean_text(ex['text'])
-                    if clean:
-                        lines.append(f"__label__{ex['category_id']} {clean}")
-                
-                temp_path = os.path.join(MODEL_DIR, 'incremental_train.txt')
-                with open(temp_path, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(lines))
-                
-                logger.info(f"📈 Инкрементальное обучение: {len(lines)} новых примеров")
-                
+    """Инкрементальное обучение только на новых данных"""
+    with self.training_lock:
+        self.is_training = True
+        try:
+            new_examples = self.db.get_new_examples(self.db.last_trained_at)
+            if not new_examples:
+                logger.info("✅ Нет новых данных для обучения")
+                return False
+            
+            lines = []
+            for ex in new_examples:
+                clean = self._clean_text(ex['text'])
+                if clean:
+                    lines.append(f"__label__{ex['category_id']} {clean}")
+            
+            if not lines:
+                logger.warning("⚠️ После очистки не осталось примеров")
+                return False
+            
+            temp_path = os.path.join(MODEL_DIR, 'incremental_train.txt')
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            
+            logger.info(f"📈 Инкрементальное обучение: {len(lines)} новых примеров")
+            
+            # ← ИСПРАВЛЕНИЕ: Проверяем существование и размер старого файла
+            combined_path = os.path.join(MODEL_DIR, 'combined_train.txt')
+            
+            if not os.path.exists(DATA_PATH) or os.path.getsize(DATA_PATH) == 0:
+                # Если нет старых данных — просто копируем новые
+                logger.info("📄 Нет предыдущих данных, используем только новые")
+                os.replace(temp_path, DATA_PATH)
+                train_path = DATA_PATH
+            else:
                 # Объединяем старые + новые данные
-                combined_path = os.path.join(MODEL_DIR, 'combined_train.txt')
                 with open(DATA_PATH, 'r', encoding='utf-8') as f_old, \
                      open(temp_path, 'r', encoding='utf-8') as f_new, \
                      open(combined_path, 'w', encoding='utf-8') as f_out:
-                    old_data = f_old.read()
-                    new_data = f_new.read()
-                    f_out.write(old_data + ('\n' if old_data and new_data else '') + new_data)
-                
-                self.model = fasttext.train_supervised(
-                    input=combined_path,
-                    lr=self.lr,
-                    epoch=self.incremental_epoch,
-                    wordNgrams=self.word_ngrams,
-                    dim=self.dim,
-                    loss='softmax'
-                )
+                    old_data = f_old.read().strip()
+                    new_data = f_new.read().strip()
+                    
+                    if old_data and new_data:
+                        f_out.write(old_data + '\n' + new_data)
+                    elif old_data:
+                        f_out.write(old_data)
+                    elif new_data:
+                        f_out.write(new_data)
+                    else:
+                        logger.error("❌ Оба файла пусты!")
+                        return False
                 
                 os.replace(combined_path, DATA_PATH)
+                train_path = DATA_PATH
+            
+            # ← ИСПРАВЛЕНИЕ: Проверяем, что файл не пуст перед обучением
+            if os.path.getsize(train_path) == 0:
+                logger.error("❌ Обучающий файл пуст!")
+                return False
+            
+            self.model = fasttext.train_supervised(
+                input=train_path,
+                lr=self.lr,
+                epoch=self.incremental_epoch,
+                wordNgrams=self.word_ngrams,
+                dim=self.dim,
+                loss='softmax'
+            )
+            
+            self._save_model_and_meta(
+                self.db.get_all_categories(), 
+                len(lines), 
+                "incremental"
+            )
+            
+            return True
                 
-                self._save_model_and_meta(
-                    self.db.get_all_categories(), 
-                    len(lines), 
-                    "incremental"
-                )
-                
-                return True
-                
-            finally:
-                self.is_training = False
+        finally:
+            self.is_training = False
     
     def _save_model_and_meta(self, categories, count, train_type):
         """Сохраняет модель и метаданные"""
