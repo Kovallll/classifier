@@ -300,15 +300,16 @@ class CategorizerService:
 
             alternatives = []
             for label, prob in zip(labels, probs):
-                cat_id = int(label.replace('__label__', ''))
+                # id категории может быть int или UUID (строка) — не приводим к int
+                raw_id = label.replace('__label__', '')
                 
                 cat_meta = next(
-                    (c for c in self.categories_cache if c['id'] == cat_id),
-                    {'name': str(cat_id), 'icon': '❓', 'color': '#CCCCCC'}
+                    (c for c in self.categories_cache if str(c['id']) == raw_id),
+                    {'name': raw_id, 'icon': '❓', 'color': '#CCCCCC'}
                 )
                 
                 alternatives.append({
-                    'category_id': str(cat_id),
+                    'category_id': raw_id,
                     'category_name': cat_meta['name'],
                     'category_icon': cat_meta['icon'],
                     'category_color': cat_meta['color'],
