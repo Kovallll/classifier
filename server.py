@@ -293,7 +293,11 @@ class CategorizerService:
         
         try:
             labels, probs = self.model.predict(clean, k=3)
-            
+            # Приведение к спискам Python, чтобы избежать ошибки NumPy
+            # "Unable to avoid copy while creating an array as requested" (на части хостингов)
+            labels = [str(x) for x in labels]
+            probs = [float(x) for x in probs]
+
             alternatives = []
             for label, prob in zip(labels, probs):
                 cat_id = int(label.replace('__label__', ''))
@@ -308,7 +312,7 @@ class CategorizerService:
                     'category_name': cat_meta['name'],
                     'category_icon': cat_meta['icon'],
                     'category_color': cat_meta['color'],
-                    'confidence': float(prob)
+                    'confidence': prob
                 })
             
             primary = alternatives[0] if alternatives else None
