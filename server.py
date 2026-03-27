@@ -362,9 +362,16 @@ class CategorizerService:
         }
     
     def get_model_info(self) -> dict:
-        """Информация о модели"""
+        """Информация о модели (model_version меняется при переобучении для инвалидации кэша)."""
+        version_parts = (
+            self.db.last_trained_at.isoformat(),
+            str(len(self.training_data)),
+            str(len(self.categories_cache)),
+        )
+        model_version = hashlib.sha256('|'.join(version_parts).encode()).hexdigest()[:16]
         return {
             'success': True,
+            'model_version': model_version,
             'last_trained_at': self.db.last_trained_at.isoformat(),
             'examples_count': len(self.training_data),
             'categories_count': len(self.categories_cache),

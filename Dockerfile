@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8080
+# Должен совпадать с ML_PORT / ML_SERVICE_URL в docker-compose (по умолчанию 50051)
+EXPOSE 50051
 
 CMD ["python", "server.py"]

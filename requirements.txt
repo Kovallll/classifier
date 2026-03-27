@@ -1,5 +1,6 @@
 # NumPy 2.x несовместим с fasttext-wheel (ошибка "Unable to avoid copy while creating an array")
 numpy<2
 fasttext-wheel==0.9.2
-psycopg2==2.9.9
+# binary — колёса без gcc в slim-образе (import psycopg2 без изменений)
+psycopg2-binary==2.9.9
 Flask==3.0.0
