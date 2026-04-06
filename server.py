@@ -37,20 +37,30 @@ class DatabaseReader:
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT id, name, icon, color 
-                    FROM categories 
-                    ORDER BY name
+                    SELECT
+                      c.id,
+                      c.name,
+                      c.icon,
+                      c.color,
+                      COALESCE(
+                        json_agg(
+                          json_build_object('text', e.text, 'created_at', e.created_at)
+                          ORDER BY e.created_at
+                        ) FILTER (WHERE e.text IS NOT NULL),
+                        '[]'::json
+                      ) AS examples_data
+                    FROM categories c
+                    LEFT JOIN examples e ON e.category_id = c.id
+                    GROUP BY c.id, c.name, c.icon, c.color
+                    ORDER BY c.name
                 """)
                 categories = []
                 for row in cur.fetchall():
                     cat = dict(row)
-                    cur.execute("""
-                        SELECT text, created_at FROM examples 
-                        WHERE category_id = %s
-                    """, (cat['id'],))
-                    rows = cur.fetchall()
-                    cat['examples'] = [r['text'] for r in rows]
-                    cat['created_ats'] = [r['created_at'] for r in rows]
+                    data = cat.get('examples_data') or []
+                    cat['examples'] = [x.get('text') for x in data if x.get('text')]
+                    cat['created_ats'] = [x.get('created_at') for x in data if x.get('created_at')]
+                    cat.pop('examples_data', None)
                     categories.append(cat)
                 return categories
         finally:
@@ -76,6 +86,9 @@ class CategorizerService:
         self.categories_cache = []
         self.training_data = []
         self.last_trained_hash = set()
+        self.last_retrain_requested_at = 0.0
+        self.pending_full_retrain = False
+        self.min_retrain_interval_sec = int(os.getenv('RETRAIN_MIN_INTERVAL_SEC', '15'))
         
         # Параметры FastText
         self.lr = 0.5
@@ -99,16 +112,32 @@ class CategorizerService:
         return ' '.join(text.split())
     
     def _generate_training_lines(self, categories) -> list[str]:
-        """Генерация строк обучения в памяти"""
+        """Генерация строк обучения в памяти.
+        Включаем очищенное имя категории — иначе совпадение только по примерам из examples,
+        а лексикон на бэкенде не связывает разные языки (напр. «одежда» и «Shopping»).
+        """
         lines = []
         for cat in categories:
+            cid = cat['id']
+            name_clean = self._clean_text(cat.get('name') or '')
+            if name_clean:
+                lines.append(f"__label__{cid} {name_clean}")
             for example in cat.get('examples', []):
                 clean = self._clean_text(example)
                 if clean:
-                    line = f"__label__{cat['id']} {clean}"
+                    line = f"__label__{cid} {clean}"
                     lines.append(line)
         return lines
-    
+
+    @staticmethod
+    def _label_id_matches_category_id(label_raw: str, cat_id) -> bool:
+        """Совпадение id из метки FastText и id категории в БД (UUID — без учёта регистра)."""
+        a = str(label_raw).strip()
+        b = str(cat_id).strip()
+        if len(a) >= 32 and len(b) >= 32 and a.count('-') >= 4 and b.count('-') >= 4:
+            return a.lower() == b.lower()
+        return a == b
+
     def _train_model_from_lines(self, lines: list[str], epoch: int = None) -> bool:
         """Обучение модели из списка строк в памяти"""
         if not lines:
@@ -242,7 +271,7 @@ class CategorizerService:
     def _create_dummy_model(self):
         """Создаёт минимальную модель, чтобы сервер мог работать"""
         try:
-            dummy_lines = ["__label__1 test example"]
+            dummy_lines = ["__label__unknown test example"]
             self._train_model_from_lines(dummy_lines, 1)
             logger.warning("⚠️ Создана временная заглушка модели")
         except Exception as e:
@@ -283,6 +312,20 @@ class CategorizerService:
                 'success': False,
                 'error': 'Модель не загружена'
             }
+
+        # Если кеш категорий пустой (например, после неудачного старта),
+        # пытаемся подгрузить категории из БД перед предсказанием.
+        if not self.categories_cache:
+            try:
+                self.categories_cache = self.db.get_all_categories()
+            except Exception as e:
+                logger.error(f"Не удалось загрузить категории перед predict: {e}")
+
+        if not self.categories_cache:
+            return {
+                'success': False,
+                'error': 'Категории не загружены, предсказание недоступно'
+            }
         
         clean = self._clean_text(text)
         if not clean:
@@ -301,19 +344,21 @@ class CategorizerService:
             alternatives = []
             for label, prob in zip(labels, probs):
                 # id категории может быть int или UUID (строка) — не приводим к int
-                raw_id = label.replace('__label__', '')
-                
+                raw_id = str(label).replace('__label__', '').strip()
                 cat_meta = next(
-                    (c for c in self.categories_cache if str(c['id']) == raw_id),
-                    {'name': raw_id, 'icon': '❓', 'color': '#CCCCCC'}
+                    (c for c in self.categories_cache if self._label_id_matches_category_id(raw_id, c['id'])),
+                    None,
                 )
-                
+                is_unknown = cat_meta is None
+                if is_unknown:
+                    cat_meta = {'name': 'Неизвестно', 'icon': '❓', 'color': '#CCCCCC'}
+
                 alternatives.append({
-                    'category_id': raw_id,
+                    'category_id': raw_id if not is_unknown else '',
                     'category_name': cat_meta['name'],
                     'category_icon': cat_meta['icon'],
                     'category_color': cat_meta['color'],
-                    'confidence': prob
+                    'confidence': prob if not is_unknown else min(float(prob), 0.49)
                 })
             
             primary = alternatives[0] if alternatives else None
@@ -322,7 +367,11 @@ class CategorizerService:
                 'success': True,
                 'primary': primary,
                 'alternatives': alternatives[1:],
-                'needs_confirmation': (primary['confidence'] < 0.7) if primary else True,
+                'needs_confirmation': (
+                    (not primary)
+                    or (not primary['category_id'])
+                    or (primary['confidence'] < 0.7)
+                ),
                 'source': 'fasttext'
             }
             
@@ -335,21 +384,44 @@ class CategorizerService:
     
     def force_retrain(self, full: bool = False) -> dict:
         """Принудительное обучение"""
+        now = time.time()
+        if now - self.last_retrain_requested_at < self.min_retrain_interval_sec:
+            if full:
+                self.pending_full_retrain = True
+            return {
+                'success': True,
+                'message': f"Retrain отложен (cooldown {self.min_retrain_interval_sec}s)",
+                'categories_count': len(self.categories_cache),
+                'is_training': self.is_training,
+                'queued_full': self.pending_full_retrain,
+            }
+        self.last_retrain_requested_at = now
+
         if full:
             self.last_trained_hash = set()
             self.training_data = []
             self.db.last_trained_at = datetime(1970, 1, 1)
             success = self._full_train()
             msg = "Полное переобучение выполнено" if success else "Ошибка полного обучения"
+            self.pending_full_retrain = False
         else:
-            success = self._incremental_train()
-            msg = "Инкрементальное обучение выполнено" if success else "Нет новых данных"
+            if self.pending_full_retrain:
+                self.last_trained_hash = set()
+                self.training_data = []
+                self.db.last_trained_at = datetime(1970, 1, 1)
+                success = self._full_train()
+                msg = "Выполнено отложенное полное переобучение" if success else "Ошибка полного обучения"
+                self.pending_full_retrain = False
+            else:
+                success = self._incremental_train()
+                msg = "Инкрементальное обучение выполнено" if success else "Нет новых данных"
         
         return {
             'success': success,
             'message': msg,
             'categories_count': len(self.categories_cache),
-            'is_training': self.is_training
+            'is_training': self.is_training,
+            'queued_full': self.pending_full_retrain,
         }
     
     def get_status(self) -> dict:
