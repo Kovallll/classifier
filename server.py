@@ -11,6 +11,7 @@ from threading import Lock
 import time
 import json
 import threading
+import uuid
 from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -110,6 +111,41 @@ class CategorizerService:
         text = re.sub(r'\d+[\s]*[₽руб$€]?', '', text)
         text = re.sub(r'[^\w\s]', ' ', text)
         return ' '.join(text.split())
+
+    def _to_datetime(self, value):
+        """Безопасно приводит created_at (str|datetime|None) к datetime."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return None
+            # PostgreSQL JSON может отдавать ISO со смещением/Z
+            if s.endswith('Z'):
+                s = s[:-1] + '+00:00'
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+        return None
+
+    def _new_trace_id(self) -> str:
+        return uuid.uuid4().hex[:12]
+
+    def _preview_text(self, text: str, limit: int = 120) -> str:
+        if text is None:
+            return ""
+        s = str(text).replace('\n', ' ').replace('\r', ' ')
+        return s[:limit] + ('…' if len(s) > limit else '')
+
+    def _log_predict_stage(self, trace_id: str, stage: str, **kwargs):
+        payload = {'trace_id': trace_id, 'stage': stage, **kwargs}
+        try:
+            logger.info("classifier.trace %s", json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            logger.info("classifier.trace trace_id=%s stage=%s %s", trace_id, stage, kwargs)
     
     def _generate_training_lines(self, categories) -> list[str]:
         """Генерация строк обучения в памяти.
@@ -187,8 +223,9 @@ class CategorizerService:
                 max_created = datetime(1970, 1, 1)
                 for cat in categories:
                     for created_at in cat.get('created_ats', []):
-                        if created_at and created_at > max_created:
-                            max_created = created_at
+                        dt = self._to_datetime(created_at)
+                        if dt and dt > max_created:
+                            max_created = dt
                 
                 logger.info(f"📚 Полное обучение: {len(lines)} примеров, {len(categories)} категорий")
                 
@@ -231,8 +268,9 @@ class CategorizerService:
                             if line_hash not in self.last_trained_hash:
                                 new_lines.append(line)
                                 self.last_trained_hash.add(line_hash)
-                                if created_at and created_at > max_created:
-                                    max_created = created_at
+                                dt = self._to_datetime(created_at)
+                                if dt and dt > max_created:
+                                    max_created = dt
                 
                 if not new_lines:
                     logger.info("✅ Нет новых данных для обучения")
@@ -298,9 +336,20 @@ class CategorizerService:
         threading.Thread(target=watch, daemon=True).start()
         logger.info("👁️ Watcher запущен (проверка каждые 30с)")
     
-    def predict(self, text: str) -> dict:
+    def predict(self, text: str, trace_id: str = None) -> dict:
         """Предсказание категории"""
+        trace_id = trace_id or self._new_trace_id()
+        self._log_predict_stage(
+            trace_id,
+            "predict_in",
+            raw_text=self._preview_text(text),
+            is_training=self.is_training,
+            categories_cache_count=len(self.categories_cache),
+            training_examples_count=len(self.training_data),
+        )
+
         if self.is_training:
+            self._log_predict_stage(trace_id, "blocked_training")
             return {
                 'success': False,
                 'error': 'Модель обучается, подождите',
@@ -308,6 +357,7 @@ class CategorizerService:
             }
         
         if not self.model:
+            self._log_predict_stage(trace_id, "blocked_no_model")
             return {
                 'success': False,
                 'error': 'Модель не загружена'
@@ -318,22 +368,53 @@ class CategorizerService:
         if not self.categories_cache:
             try:
                 self.categories_cache = self.db.get_all_categories()
+                self._log_predict_stage(
+                    trace_id,
+                    "categories_cache_reload",
+                    loaded_count=len(self.categories_cache),
+                )
             except Exception as e:
                 logger.error(f"Не удалось загрузить категории перед predict: {e}")
+                self._log_predict_stage(trace_id, "categories_cache_reload_error", error=str(e))
 
         if not self.categories_cache:
+            self._log_predict_stage(trace_id, "blocked_no_categories_cache")
             return {
                 'success': False,
                 'error': 'Категории не загружены, предсказание недоступно'
             }
         
         clean = self._clean_text(text)
+        self._log_predict_stage(
+            trace_id,
+            "text_cleaned",
+            clean_text=self._preview_text(clean),
+            clean_len=len(clean or ''),
+        )
         if not clean:
+            logger.warning("classifier.predict: пустой текст после _clean_text, raw=%r", text[:200] if text else '')
+            self._log_predict_stage(trace_id, "blocked_empty_after_clean")
             return {
                 'success': False,
                 'error': 'Пустой текст'
             }
-        
+
+        cache_n = len(self.categories_cache)
+        cache_id_sample = [str(c['id']) for c in self.categories_cache[:8]]
+        logger.info(
+            "classifier.predict: start clean=%r cache_categories=%s sample_ids=%s",
+            clean,
+            cache_n,
+            cache_id_sample,
+        )
+        self._log_predict_stage(
+            trace_id,
+            "model_predict_start",
+            clean_text=self._preview_text(clean),
+            cache_categories=cache_n,
+            sample_ids=cache_id_sample,
+        )
+
         try:
             labels, probs = self.model.predict(clean, k=3)
             # Приведение к спискам Python, чтобы избежать ошибки NumPy
@@ -341,8 +422,19 @@ class CategorizerService:
             labels = [str(x) for x in labels]
             probs = [float(x) for x in probs]
 
+            logger.info(
+                "classifier.predict: fasttext raw_labels=%s",
+                [(labels[i], round(probs[i], 4)) for i in range(len(labels))],
+            )
+            self._log_predict_stage(
+                trace_id,
+                "model_predict_raw",
+                labels=[str(x) for x in labels],
+                probs=[round(float(x), 6) for x in probs],
+            )
+
             alternatives = []
-            for label, prob in zip(labels, probs):
+            for rank, (label, prob) in enumerate(zip(labels, probs), start=1):
                 # id категории может быть int или UUID (строка) — не приводим к int
                 raw_id = str(label).replace('__label__', '').strip()
                 cat_meta = next(
@@ -351,7 +443,40 @@ class CategorizerService:
                 )
                 is_unknown = cat_meta is None
                 if is_unknown:
+                    logger.warning(
+                        "classifier.predict: rank=%s label=%r raw_id=%r prob=%.4f -> NO_MATCH in categories_cache "
+                        "(проверьте, что id в модели совпадает с id в БД; переобучение)",
+                        rank,
+                        label,
+                        raw_id,
+                        prob,
+                    )
                     cat_meta = {'name': 'Неизвестно', 'icon': '❓', 'color': '#CCCCCC'}
+                    self._log_predict_stage(
+                        trace_id,
+                        "label_no_match",
+                        rank=rank,
+                        label=label,
+                        raw_id=raw_id,
+                        prob=round(float(prob), 6),
+                    )
+                else:
+                    logger.info(
+                        "classifier.predict: rank=%s raw_id=%r -> name=%r prob=%.4f",
+                        rank,
+                        raw_id,
+                        cat_meta.get('name'),
+                        prob,
+                    )
+                    self._log_predict_stage(
+                        trace_id,
+                        "label_match",
+                        rank=rank,
+                        label=label,
+                        raw_id=raw_id,
+                        category_name=cat_meta.get('name'),
+                        prob=round(float(prob), 6),
+                    )
 
                 alternatives.append({
                     'category_id': raw_id if not is_unknown else '',
@@ -362,8 +487,28 @@ class CategorizerService:
                 })
             
             primary = alternatives[0] if alternatives else None
-            
-            return {
+            if primary:
+                logger.info(
+                    "classifier.predict: primary_out id=%r name=%r conf=%.4f needs_confirm=%s",
+                    primary.get('category_id'),
+                    primary.get('category_name'),
+                    float(primary.get('confidence') or 0),
+                    (not primary.get('category_id'))
+                    or (float(primary.get('confidence') or 0) < 0.7),
+                )
+                self._log_predict_stage(
+                    trace_id,
+                    "primary_selected",
+                    category_id=primary.get('category_id'),
+                    category_name=primary.get('category_name'),
+                    confidence=round(float(primary.get('confidence') or 0), 6),
+                    needs_confirmation=(
+                        (not primary.get('category_id'))
+                        or (float(primary.get('confidence') or 0) < 0.7)
+                    ),
+                )
+
+            response = {
                 'success': True,
                 'primary': primary,
                 'alternatives': alternatives[1:],
@@ -374,9 +519,21 @@ class CategorizerService:
                 ),
                 'source': 'fasttext'
             }
+            self._log_predict_stage(
+                trace_id,
+                "predict_out",
+                success=True,
+                source=response.get('source'),
+                needs_confirmation=response.get('needs_confirmation'),
+                primary_id=(primary or {}).get('category_id') if primary else '',
+                primary_name=(primary or {}).get('category_name') if primary else '',
+                alternatives_count=len(response.get('alternatives') or []),
+            )
+            return response
             
         except Exception as e:
             logger.error(f"Ошибка предсказания: {e}")
+            self._log_predict_stage(trace_id, "predict_error", error=str(e))
             return {
                 'success': False,
                 'error': str(e)
@@ -474,11 +631,25 @@ def health():
 def predict():
     """Предсказание категории"""
     data = request.get_json()
+    trace_id = service._new_trace_id()
+    logger.info(
+        "classifier.http predict_in trace_id=%s has_text=%s payload_keys=%s",
+        trace_id,
+        bool(data and 'text' in data),
+        sorted(list((data or {}).keys())),
+    )
     if not data or 'text' not in data:
+        logger.info("classifier.http predict_out trace_id=%s status=400 reason=missing_text", trace_id)
         return jsonify({'success': False, 'error': 'Поле text обязательно'}), 400
     
-    result = service.predict(data['text'])
+    result = service.predict(data['text'], trace_id=trace_id)
     status_code = 200 if result.get('success') else (503 if result.get('is_training') else 500)
+    logger.info(
+        "classifier.http predict_out trace_id=%s status=%s success=%s",
+        trace_id,
+        status_code,
+        bool(result.get('success')),
+    )
     return jsonify(result), status_code
 
 
